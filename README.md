@@ -5,10 +5,10 @@
 
 Python API for interfacing with UniFi Video.
 
-**Supported UniFi Video versions**: v3.9.12 to v3.10.6
+**Supported UniFi Video versions**: v3.9.12 to v3.10.13
 
 **Supported Ubiquiti camera models**: UVC, UVC G3, UVC G3 Dome, UVC Dome, UVC Pro, UVC G3 Pro,
-UVC G3 Flex, UVC Micro, UVC G3 Micro, airCam, airCam Dome, and airCam Mini.
+UVC G3 Flex, UVC Micro, UVC G3 Micro, airCam, airCam Dome, and airCam Mini, UVC G4 Bullet, UVC G4 Pro.
 
 
 ## Features
@@ -80,8 +80,17 @@ uva = UnifiVideoAPI(api_key='xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx', addr='10.3.2.1',
 # is "Garage"
 uva.get_camera('Garage').snapshot('some/path/snapshot.jpg')
 
-# Save snapshot from all cameras to ./snapshot_camera id_timestamp.jpg
+# List all cameras UniFi Video is aware of
 for camera in uva.cameras:
+  print(camera)
+
+# Save snapshot from every currently online camera managed by the UniFi Video
+# instance. Default filepath: # ./snapshot_{camera ID}_{timestamp}.jpg
+for camera in uva.active_cameras:
+  camera.snapshot()
+
+# List all cameras managed by the UniFi Video instance, online or not
+for camera in uva.managed_cameras:
   camera.snapshot()
 
 # Get footage from camera "Garage" for specific timespan.
@@ -115,14 +124,13 @@ uva.get_camera('Garage').set_recording_settings('motion')
 # Disable recording altogether
 uva.get_camera('Garage').set_recording_settings('disable')
 
-# List recordings
+# List recordings whose details were fetched during initialization
 for rec in uva.recordings:
   print(rec)
 
 # Download recording, write to local file recording01.mp4
 uva.recordings['xxxxxxxxxxxxxxxxxxxx'].download('recording01.mp4')
 ```
-
 
 ## Warning
 This software has been tested against a limited set of API versions and hardware.

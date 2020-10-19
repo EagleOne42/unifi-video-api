@@ -9,6 +9,7 @@ endpoints = {
     'snapshot': lambda c, d, r, w: \
         'snapshot/recording/{}/{}/{}?width={}'.format(c,
             d.strftime('%Y/%m/%d'), r, w),
+    'motion': lambda x: 'recording/{}/motion?alpha=true'.format(x),
 }
 
 class UnifiVideoRecording(UnifiVideoSingle):
@@ -16,8 +17,10 @@ class UnifiVideoRecording(UnifiVideoSingle):
 
     Attributes:
         _id (str): Recording ID (MongoDB ObjectID as hex string)
-        start_time (datetime): Recording start time and date
-        end_time (datetime): Recording end time and date
+        start_time (datetime): Recording start time and date (local time)
+        end_time (datetime): Recording end time and date (local time)
+        start_time_utc (datetime): Recording start time and date (UTC)
+        end_time_utc (datetime): Recording end time and date (UTC)
         rec_type (str): Recording type. Either `motionRecording`,
             or `fullTimeRecording`.
         locked (bool, NoneType): Whether or not recording is locked
@@ -41,6 +44,10 @@ class UnifiVideoRecording(UnifiVideoSingle):
             int(data.get('startTime', 0) / 1000))
         self.end_time = datetime.fromtimestamp(
             int(data.get('endTime', 0) / 1000))
+        self.start_time_utc = datetime.utcfromtimestamp(
+            int(data.get('startTime', 0) / 1000))
+        self.end_time_utc = datetime.utcfromtimestamp(
+            int(data.get('endTime', 0) / 1000))
 
     def download(self, filename=None):
         """Download recording
@@ -63,6 +70,30 @@ class UnifiVideoRecording(UnifiVideoSingle):
         return self._api.get(endpoints['download'](self._id),
             filename if filename else 'recording-{}-{}.mp4'.format(
                 self._id, self.start_time.isoformat()))
+
+    def motion(self, filename=None):
+        """Download recording motion
+
+        Arguments:
+            filename (str, NoneType, bool): Filename (`str`) to save the
+                image as or ``True`` (`bool`) if you want the response body
+                as a return value. You can also leave this out or set it to
+                ``None`` or ``False`` and a filename will be generated for you.
+
+        Return value:
+            Depends on input params.
+
+            - When ``filename`` is `str`, `NoneType` or ``False``: `True` if
+              write to file was successful, otherwise `NoneType`
+
+            - When ``filename`` is ``True``: raw response body (`str`)
+        """
+
+        if self.rec_type == 'fullTimeRecording':
+            return False
+
+        return self._api.get(endpoints['motion'](self._id),
+            filename if filename else 'motion-{}.png'.format(self._id))
 
     def snapshot(self, width=600, filename=None):
         """Download recording thumbnail

@@ -16,6 +16,7 @@ import json
 from .camera import UnifiVideoCamera
 from .recording import UnifiVideoRecording
 from .collections import UnifiVideoCollection
+from .utils import parse_gmt_offset, dt_resolvable_to_ms
 
 from distutils.version import LooseVersion
 
@@ -28,8 +29,12 @@ endpoints = {
     'login': 'login',
     'cameras': 'camera',
     'recordings': lambda x: 'recording?idsOnly=false&' \
-        'sortBy=startTime&sort=desc&limit={}'.format(x),
+        'sortBy=startTime&sort=desc&limit={}'.format(x) \
+        if x is not None else 'recording',
+    'recording': lambda x: 'recording/{}'.format(
+        x._id if isinstance(x, UnifiVideoRecording) else x),
     'bootstrap': 'bootstrap',
+    'delete_all': 'recording?deleteRecordings&confirmed=true',
 }
 
 class UnifiVideoVersionError(ValueError):
@@ -40,6 +45,16 @@ class UnifiVideoVersionError(ValueError):
             message = 'Unsupported UniFi Video version'
         super(UnifiVideoVersionError, self).__init__(message)
 
+class UnifiVideoHTTPError(ValueError):
+    """HTTP error with message from UniFi Video server"""
+
+    def __init__(self, code=None, message=None, caused_by=None):
+        msg = 'HTTP {} from UniFi Video.'.format(code)
+        if message:
+            msg += ' Error: {}.'.format(message)
+        if caused_by:
+            msg += ' Caused by: {}'.format(caused_by)
+        super(UnifiVideoHTTPError, self).__init__(msg)
 
 class UnifiVideoAPI(object):
     """Encapsulates a single UniFi Video server.
@@ -55,6 +70,8 @@ class UnifiVideoAPI(object):
             connecting over HTTPS
         check_ufv_version (bool): Set to ``False`` to use with untested
             UniFi Video versions
+        utc_offset_sec (int or NoneType): UniFi Video server's UTC offset
+            in seconds.
 
     Note:
 
@@ -70,22 +87,36 @@ class UnifiVideoAPI(object):
         api_key (str or NoneType): API key (from input params)
         username (str or NoneType): Username (from input params)
         password (str or NoneType): Password (from input params)
+        name (str or NoneType): UniFi Video server name
+        version (str or NoneType): UniFi Video version
         jsession_av (str or NoneType): UniFi Video session ID
 
-        cameras (:class:`~unifi_video.collections.UnifiVideoCollection`):
-            Collection of :class:`~unifi_video.camera.UnifiVideoCamera` objects
+        cameras (:class:`UnifiVideoCollection`):
+            Collection of :class:`~unifi_video.camera.UnifiVideoCamera`
+            objects. Includes all cameras that the associated UniFi Video
+            instance is aware of
 
-        recordings (:class:`~unifi_video.collections.UnifiVideoCollection`):
+        active_cameras (:class:`UnifiVideoCollection`):
+            Like :attr:`UnifiVideoAPI.cameras` but only includes cameras
+            that are both connected and managed by the UniFi Video instance.
+
+        managed_cameras (:class:`UnifiVideoCollection`):
+            Includes all cameras that are managed by the UniFi Video instance,
+            whether they're online or not.
+
+        recordings (:class:`UnifiVideoCollection`):
             Collection of :class:`~unifi_video.recording.UnifiVideoRecording`
             objects
     """
 
     _supported_ufv_versions = []
-    _supported_ufv_version_ranges = [['3.9.12','3.10.10']]
+    _supported_ufv_version_ranges = [
+        ['3.9.12', '3.10.13'],
+    ]
 
     def __init__(self, api_key=None, username=None, password=None,
             addr='localhost', port=7080, schema='http', verify_cert=True,
-            check_ufv_version=True):
+            check_ufv_version=True, utc_offset_sec=None):
 
         if not verify_cert and schema == 'https':
             import ssl
@@ -100,29 +131,54 @@ class UnifiVideoAPI(object):
         self.jsession_av = None
         self.username = username
         self.password = password
+        self.utc_offset = utc_offset_sec
         self.base_url = '{}://{}:{}/api/2.0/'.format(schema, addr, port)
         self._version_stickler = check_ufv_version
 
         self._load_data(self.get(endpoints['bootstrap']))
 
         self.cameras = UnifiVideoCollection(UnifiVideoCamera)
+        self.active_cameras = UnifiVideoCollection(UnifiVideoCamera)
+        self.managed_cameras = UnifiVideoCollection(UnifiVideoCamera)
         self.recordings = UnifiVideoCollection(UnifiVideoRecording)
         self.refresh_cameras()
         self.refresh_recordings()
+
+        # /bootstrap: data[0].settings.systemSettings.gmtOffset first appeared
+        # in version 3.10.2. For earlier versions, try to determine the offset
+        # by comparing what is reported by attached cameras. If all cameras
+        # report the same offset, use that offset for the server as well
+        if self.utc_offset is None:
+            camera_utc_offsets = set([
+                c.utc_offset for c in self.active_cameras
+                if c.utc_offset is not None])
+            if len(camera_utc_offsets) == 1:
+                self.utc_offset = camera_utc_offsets.pop()
 
     def _load_data(self, data):
         if not isinstance(data, dict):
             raise ValueError('Server responded with unknown bootstrap data')
         self._data = data.get('data', [{}])
-        self._name = self._data[0].get('nvrName', None)
-        self._version = self._data[0].get('systemInfo', {}).get('version', None)
+        self.name = self._data[0].get('nvrName', None)
+        self.version = self._data[0].get('systemInfo', {}).get('version', None)
 
         self._is_supported = False
 
-        if self._version in UnifiVideoAPI._supported_ufv_versions:
+        if self.utc_offset is None:
+            system_settings = \
+                self._data[0].get('settings', {}).get('systemSettings', {}) \
+                    or self._data[0].get('servers', [{}])[0]\
+                        .get('systemSettings', {})
+            try:
+                self.utc_offset = parse_gmt_offset(
+                    system_settings.get('gmtOffset', ''))
+            except (TypeError, ValueError):
+                pass
+
+        if self.version in UnifiVideoAPI._supported_ufv_versions:
             self._is_supported = True
         else:
-            v_actual = LooseVersion(self._version)
+            v_actual = LooseVersion(self.version)
             for curr_version in UnifiVideoAPI._supported_ufv_version_ranges:
                 v_low = LooseVersion(curr_version[0])
                 v_high = LooseVersion(curr_version[1])
@@ -168,9 +224,9 @@ class UnifiVideoAPI(object):
                     return True
 
     def _urlopen(self, req):
-        try:
+        if hasattr(self, '_ssl_context'):
             return urlopen(req, context=self._ssl_context)
-        except AttributeError:
+        else:
             return urlopen(req)
 
     def _get_response_content(self, res, raw=False):
@@ -211,14 +267,18 @@ class UnifiVideoAPI(object):
         elif self.login():
             return self.get(url, raw)
 
-    def get(self, url, raw=False):
+    def get(self, url, raw=False, url_params={}):
         """Send GET request.
 
         Arguments:
-            url (str): API endpoint (relative to the API base URL)
-            raw (str or bool): Set `str` filename if you want to save the
-                response to a file.  Set to ``True``  if you want the to
-                return raw response data.
+            url (str):
+                API endpoint (relative to the API base URL)
+            raw (str or bool, optional):
+                Set `str` filename if you want to save the response to a file.
+                Set to ``True``  if you want the to return raw response data.
+            url_params (dict, optional):
+                URL parameters as a dict. Gets turned into query string and
+                appended to ``url``
 
         Returns:
             Response JSON (as `dict`) when `Content-Type` response header is
@@ -235,6 +295,10 @@ class UnifiVideoAPI(object):
         :rtype: NoneType, bool, dict, bytes
         """
 
+        if url_params:
+            url = '{}?{}'.format(
+                url, UnifiVideoAPI.params_to_query_str(url_params))
+
         req = self._build_req(url)
         try:
             res = self._urlopen(req)
@@ -243,6 +307,15 @@ class UnifiVideoAPI(object):
         except HTTPError as err:
             if err.code == 401 and self.login_attempts == 0:
                 return self._handle_http_401(url, raw)
+            elif err.code == 400 and hasattr(err, 'headers') \
+                    and 'application/json' in err.headers.get(
+                        'content-type', ''):
+                err_body = json.loads(err.read().decode('utf8'))
+                if isinstance(err_body, dict) and err_body.get('rc') == 'error':
+                    raise UnifiVideoHTTPError(
+                        code=err.code,
+                        message=err_body.get('message'),
+                        caused_by=err_body.get('causedBy'))
             return False
 
     def post(self, url, data=None, raw=False, _method=None):
@@ -303,13 +376,47 @@ class UnifiVideoAPI(object):
             return False
 
     def refresh_cameras(self):
-        """GET cameras from the server and update ``self.cameras``.
-        """
+        '''GET cameras from the server and update camera collections
 
+        Touches :attr:`UnifiVideoAPI.cameras`,
+        :attr:`UnifiVideoAPI.active_cameras`, and
+        :attr:`UnifiVideoAPI.managed_cameras`
+        '''
+
+        collections = {
+            'cameras': {
+                'new_ids': set(),
+                'accepts': lambda _: True,
+            },
+            'active_cameras': {
+                'new_ids': set(),
+                'accepts': lambda cam: cam.managed and cam.connected,
+            },
+            'managed_cameras': {
+                'new_ids': set(),
+                'accepts': lambda cam: cam.managed,
+            },
+        }
+
+        # Suspicion: the type check provides zero value and exists simply due
+        # to some momentary lapse in coherence at the time it was originally
+        # written. Leaving it be, on the off chance that there was a good
+        # reason for it. Unable to investigate atm.
         cameras = self.get(endpoints['cameras'])
-        if isinstance(cameras, dict):
-            for camera in cameras.get('data', []):
-                self.cameras.add(UnifiVideoCamera(self, camera))
+        if not isinstance(cameras, dict):
+            return
+
+        for camera in (
+                UnifiVideoCamera(self, c) for c in cameras.get('data', [])):
+            for cname, collection in collections.items():
+                if collection['accepts'](camera):
+                    getattr(self, cname).add(camera)
+                    collection['new_ids'].add(camera._id)
+
+        for cname in collections.keys():
+            for camera_id in list(getattr(self, cname).keys()):
+                if camera_id not in collections[cname]['new_ids']:
+                    del getattr(self, cname)[camera_id]
 
     def refresh_recordings(self, limit=300):
         """GET recordings from the server and update ``self.recordings``.
@@ -318,34 +425,169 @@ class UnifiVideoAPI(object):
             to fetch (``0`` for no limit).
         """
 
-        recordings = self.get(endpoints['recordings'](limit))
-        if isinstance(recordings, dict):
-            for recording in recordings.get('data', []):
-                self.recordings.add(UnifiVideoRecording(self, recording))
+        for recording in self.get_recordings(
+                rec_type='all', order='desc', limit=limit):
+            self.recordings.add(recording)
 
-    def get_camera(self, search_term):
-        """Get a camera whose :attr:`~unifi_video.UnifiVideoCamera.name`,
-        :attr:`~unifi_video.UnifiVideoCamera._id`, or
-        :attr:`~unifi_video.UnifiVideoCamera.overlay_text` matches `search_term`.
+    def get_camera(self, search_term, managed_only=False):
+        '''Get camera by its ObjectID, name or overlay text
+
+        Arguments:
+            search_term (str):
+                String to test against
+                :attr:`~unifi_video.UnifiVideoCamera.name`,
+                :attr:`~unifi_video.UnifiVideoCamera._id`, and
+                :attr:`~unifi_video.UnifiVideoCamera.overlay_text`.
+
+            managed_only (bool):
+                Whether to search unmanaged cameras as well.
 
         Returns:
             :class:`~unifi_video.camera.UnifiVideoCamera` or `NoneType`
             depending on whether or not `search_term` was matched to a camera.
-        """
+
+        Tip:
+            Do not attempt to find an unmanaged camera by it's overlay text;
+            UniFi Video provides limited detail for unmanaged cameras.
+
+        '''
 
         search_term = search_term.lower()
         for camera in self.cameras:
-            if camera._id == search_term or \
+            is_match = camera._id == search_term or \
                     camera.name.lower() == search_term or \
-                    camera.overlay_text.lower() == search_term:
+                    camera.overlay_text.lower() == search_term
+            if is_match and (not managed_only or camera.managed):
                 return camera
+
+    def get_recordings(self, rec_type='all', camera=None, start_time=None,
+            end_time=None, limit=0, order='desc', req_each=False):
+        '''Fetch recording listing
+
+        Args:
+            rec_type (str, optional):
+                Type of recordings to fetch: *all*, *motion* or *fulltime*
+
+            camera (:class:`~unifi_video.camera.UnifiVideoCamera` or str or \
+                    list of :class:`~unifi_video.camera.UnifiVideoCamera` or \
+                    list of str, optional):
+                Camera or cameras whose recordings to fetch
+
+            start_time (datetime or str or int, optional):
+                Recording start time. (See
+                :meth:`~unifi_video.utils.dt_resolvable_to_ms`.)
+
+            end_time (datetime or str or int, optional):
+                Recording end time. (See
+                :meth:`~unifi_video.utils.dt_resolvable_to_ms`.)
+
+            order (str, optional):
+                Sort order: *desc* or *asc*. Recordings are sorted by their
+                start time.
+
+            limit (int, optional):
+                Limit the number of recordings
+
+            req_each (bool, optional):
+                Whether to save bandwidth on the initial request and to fetch
+                each recordings' details individually or to ask for each
+                recordings' details to be included in the one and only initial
+                request. ``True`` can potentially save you in total bytes
+                transferred but will cost you in the number of HTTP requests
+                made.
+
+        Returns:
+            Iterable[:class:`~unifi_video.recording.UnifiVideoRecording`]
+
+        Note:
+            You can use naive :class:`~datetime.datetime` objects or strings
+            when you want to mark time in the UniFi Server's local time.
+            Otherwise, use Unix timestamps (*int*, **in seconds**) or timezone
+            aware :class:`~datetime.datetime` objects.
+        '''
+
+        rec_types = {
+            'motion': ('motionRecording',),
+            'fulltime': ('fullTimeRecording',),
+            'all': ('motionRecording', 'fullTimeRecording'),
+        }
+
+        url_params = {
+            'sortBy': 'startTime',
+            'order': order,
+            'idsOnly': req_each,
+            'limit': limit if limit else None,
+            'cause': rec_types[rec_type],
+            'startTime': dt_resolvable_to_ms(
+                start_time,
+                utc_offset=self.utc_offset,
+                resolution=1000) if start_time else None,
+            'endTime': dt_resolvable_to_ms(
+                end_time,
+                utc_offset=self.utc_offset,
+                resolution=1000) if end_time else None,
+            'cameras': camera if isinstance(camera, (list, tuple)) else [camera],
+        }
+
+        if req_each:
+            return (
+                UnifiVideoRecording(
+                    self,
+                    self.get(endpoints['recording'](rec_id))['data'][0])
+                for rec_id in self.get(
+                    endpoints['recordings'](None),
+                    url_params=url_params)['data']
+            )
+        else:
+            return (
+                UnifiVideoRecording(self, rec)
+                for rec in self.get(
+                    endpoints['recordings'](None),
+                    url_params=url_params)['data']
+            )
+
+    def delete_all_recordings(self):
+        """ Delete all existing recordings """
+
+        return self.delete(endpoints['delete_all'])
 
     def __str__(self):
         return '{}: {}'.format(type(self).__name__, {
-            'name': self._name,
-            'version': self._version,
+            'name': self.name,
+            'version': self.version,
             'supported_version': self._is_supported
         })
 
+    @staticmethod
+    def params_to_query_str(params_dict):
+        '''Build query string from dict of URL parameters
+
+        Arguments:
+            params_dict (dict):
+                URL parameters
+
+        Returns:
+            str: Query string
+        '''
+
+        str_conversions = {
+            str: lambda x: x,
+            unicode: lambda x: x,
+            int: lambda x: '{}'.format(x),
+            float: lambda x: '{}'.format(x),
+            bool: lambda x: 'true' if x else 'false',
+            UnifiVideoCamera: lambda x: x._id,
+        }
+
+        params = []
+        for k, v in ((k, v) for k, v in params_dict.items() if v is not None):
+            if isinstance(v, (list, tuple)):
+                for lv in (x for x in v if x is not None):
+                    params.append('{}[]={}'.format(
+                        k, str_conversions[type(lv)](lv)))
+            else:
+                params.append('{}={}'.format(k, str_conversions[type(v)](v)))
+
+        return '&'.join(params)
 
 __all__ = ['UnifiVideoAPI']

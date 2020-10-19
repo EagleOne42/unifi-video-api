@@ -1,6 +1,7 @@
 from __future__ import print_function, unicode_literals
 from functools import wraps
 from copy import deepcopy
+from datetime import datetime
 
 import time
 
@@ -16,19 +17,28 @@ endpoints = {
         'startTime={}&endTime={}&cameras[]={}'.format(s, e, x)
 }
 
+# Supported camera models, checked during UnifiVideoCamera initialization.
+#
+# Some model specifications include list of supported features. These are
+# not currently checked against and are included only to account for
+# some potential future use.
+#
+# The structure is constructed from bits gleaned from the frontend JS
+# served by UniFi Video.
 models = {
     'UVC': {},
 
     'UVC G3': {
         'features': [
             'external_accessory'
-        ]
+        ],
     },
 
     'UVC G3 Dome': {
         'features': [
-            'can_play_sound', 'toggable_led'
-        ]
+            'can_play_sound',
+            'toggable_led',
+        ],
     },
 
     'UVC Dome': {},
@@ -36,39 +46,43 @@ models = {
     'UVC Pro': {
         'pro': True,
         'features': [
-            'optical_zoom'
-        ]
+            'optical_zoom',
+        ],
     },
 
     'UVC G3 Pro': {
         'pro': True,
         'features': [
-            'optical_zoom'
-        ]
+            'optical_zoom',
+        ],
     },
 
     'UVC G3 Flex': {
         'features': [
-            'can_play_sound', 'toggable_led'
-        ]
+            'can_play_sound',
+            'toggable_led',
+        ],
     },
 
     'UVC Micro': {
         'features': [
-            'can_play_sound', 'toggable_led'
-        ]
+            'can_play_sound',
+            'toggable_led',
+        ],
     },
 
     'UVC G3 Micro': {
         'features': [
-            'can_play_sound', 'toggable_led'
-        ]
+            'can_play_sound',
+            'toggable_led',
+        ],
     },
 
     'Vision Pro': {
         'features': [
-            'can_play_sound', 'toggable_led'
-        ]
+            'can_play_sound',
+            'toggable_led',
+        ],
     },
 
     'airCam': {},
@@ -76,6 +90,19 @@ models = {
     'airCam Dome': {},
 
     'airCam Mini': {},
+
+    'UVC G4 Bullet': {
+        'features': [
+        ],
+    },
+
+    'UVC G4 Pro': {
+        'features': [
+            'toggable_led',
+            'optical_zoom',
+            'animate_led_on_motion',
+        ],
+    },
 }
 
 common_isp_actionables = [
@@ -111,7 +138,7 @@ def isp_actionable(floor=0, ceiling=100, name=None):
             if fn_name not in camera._isp_actionables:
                 raise CameraModelError('This camera model ({}) has no ' \
                     'support for {} control'.format(camera.model, fn_name))
-            if val == None:
+            if val is None:
                 return fn(camera)
             if val > ceiling:
                 val = ceiling
@@ -123,9 +150,10 @@ def isp_actionable(floor=0, ceiling=100, name=None):
 
 def add_actionable(actionable):
     name, floor, ceiling = actionable
+
     def fn(self, value=None):
         isp = self._data['ispSettings']
-        if value == None:
+        if value is None:
             return isp.get(name, -1)
         isp[name] = value
         self.update(True)
@@ -134,17 +162,18 @@ def add_actionable(actionable):
         else:
             return False
     fn.__name__ = str(name)
-    fn.__doc__ =  """Control image {}
+    fn.__doc__ = """Control image {name}
 
     Args:
-        value (int or NoneType): New {} value
+        value (int or NoneType): New {name} value
+            (min: ``{floor}``, max: ``{ceiling}``)
 
     Returns:
         bool or int: ``True`` or ``False``, depending on whether new value
-        value was successfully registered. Current {} value when
+        value was successfully registered. Current {name} value when
         called without input value.
 
-    """.format(name, name, name)
+    """.format(name=name, floor=floor, ceiling=ceiling)
 
     setattr(UnifiVideoCamera, name, isp_actionable(floor, ceiling)(fn))
 
@@ -161,22 +190,66 @@ class UnifiVideoCamera(UnifiVideoSingle):
     (:class:`~unifi_video.api.UnifiVideoAPI`).
 
     Attributes:
-        _id (str): Camera ID (MongoDB ObjectID as hex string)
-        name (str or NoneType): Camera name
-        model (str or NoneType): Camera model
-        platform (str or NoneType): Firmware platform
-        overlay_text (str): Custom text overlayd over the image
-        mac_addr (str): Camera MAC address
-        utc_h_offset (int): UTC offset in hours
-        _data (dict): Complete camera JSON from UniFi Video server
-        _isp_actionables (list): List of supported image settings
+        name (str or NoneType):
+            Camera name
+        model (str or NoneType):
+            Camera model
+        platform (str or NoneType):
+            Firmware platform
+        overlay_text (str):
+            Custom text overlayd over the image
+        mac_addr (str):
+            Camera MAC address
+        utc_h_offset (int or NoneType):
+            UTC offset in hours
+        state (str):
+            Camera state
+        managed (bool):
+            Whether camera is managed by the UniFi Video instance
+        provisioned (bool):
+            Whether camera is provisioned
+        managed_by_others (bool):
+            Whether camera is managed by some other UniFi Video instance
+        disconnect_reason (str):
+            Reason for most recent disconnect
+        connected (bool):
+            Whether camera is connected (ie, not disconnected or in process of
+            rebooting or being upgraded)
+        last_recording_id (str):
+            MongoDB ObjectID of latest recording
+        last_recording_start_time (int):
+            Unix timestamp (in ms): start time of latest recording
+        last_seen (int):
+            Unix timestamp (in ms). Meaning depends on the value of
+            :attr:`UnifiVideoCamera.state`:
+
+                - *CONNECTED*: timestamp for when the camera came online
+                - *DISCONNECTED*: timestamp for when the camera went offline
+        last_seen_ndt (datetime or NoneType):
+            :attr:`UnifiVideoCamera.last_seen` as naive :class:`datetime` object
+        _id (str):
+            Camera ID (MongoDB ObjectID as hex string)
+        _data (dict):
+            Complete camera JSON from UniFi Video server
+        _isp_actionables (list):
+            List of supported image settings
+
+    Warning:
+        Attributes having to do with camera state reflect the state
+        as it was during object instantiation.
+
+    Warning:
+        :attr:`UnifiVideoCamera.last_seen` changes were observed on
+        UniFi Video v3.10.13. No attempt has been made to verify
+        :attr:`UnifiVideoCamera.last_seen` acts the same way across
+        all supported UniFi Video versions.
     """
 
     def _load_data(self, data):
 
         self.model = data.get('model', None)
 
-        if not self.model or not models.get(self.model, None):
+        if not self.model or self.model not in models:
             raise CameraModelError
 
         self._data = data
@@ -187,16 +260,30 @@ class UnifiVideoCamera(UnifiVideoSingle):
         self.mac_addr = utils.format_mac_addr(data.get('mac', 'ffffffffffff'))
         self._isp_actionables = determine_img_actionables(self.platform,
             self.model)
+        self.state = data.get('state', '')
+        self.managed = data.get('managed', None)
+        self.provisioned = data.get('provisioned', None)
+        self.managed_by_others = data.get('managedByOthers', None)
+        self.disconnect_reason = data.get('disconnectReason') or ''
+        self.connected = self.state == 'CONNECTED'
+        self.last_recording_id = data.get('lastRecordingId', '') or ''
+        self.last_recording_start_time = \
+            data.get('lastRecordingStartTime', 0) or 0
+        self.last_seen = data.get('lastSeen', 0)
+        self.last_seen_ndt = datetime.fromtimestamp(self.last_seen / 1000) \
+            if self.last_seen else None
 
         try:
-            self.utc_h_offset = int(data.get('deviceSettings', {})\
-                .get('timezone', '').split('GMT').pop())
+            self.utc_offset = utils.parse_gmt_offset(
+                (data.get('deviceSettings') or {}).get('timezone', ''))
+            self.utc_h_offset = self.utc_offset / 3600
         except (TypeError, ValueError):
-            self.utc_h_offset = 0
+            self.utc_offset = None
+            self.utc_h_offset = None
 
     def _simple_isp_actionable(self, setting_name, value):
         isp = self._data['ispSettings']
-        if value == None:
+        if value is None:
             return isp.get(setting_name, -1)
         isp[setting_name] = value
         self.update(True)
@@ -245,23 +332,33 @@ class UnifiVideoCamera(UnifiVideoSingle):
                 self._id, int(time.time())))
 
     def recording_between(self, start_time, end_time, filename=None):
-        """Download a recording of the camera's footage from an arbitrary
+        '''Download a recording of the camera's footage from an arbitrary
         timespan, between ``start_time`` and ``end_time``.
 
-        :param str start_time: Start time
-        :param str end_time: End time
-        :param filename: Filename to save the recording to (a ZIP file).
-            Will use whatever the server provides if ``None``.
-        :type filename: str or None
+        Arguments:
+            start_time (datetime or str or int):
+                Recording start time. (See
+                :meth:`~unifi_video.utils.dt_resolvable_to_ms`.)
+            end_time (datetime or str or int):
+                Recording end time. (See
+                :meth:`~unifi_video.utils.dt_resolvable_to_ms`.)
+            filename (str, optional):
+                Filename to save the recording to (a ZIP file).
+                Will use whatever the server provides if left out.
 
-        Note: times should be in the format ``YYYY-MM-DD HH:MM:SS``.
-        """
+        Tip:
+            Widen the time span by a few seconds at each end. UniFi Video often
+            falls a little short of the exact start and end times.
+        '''
 
-        start_time = utils.tz_shift(self.utc_h_offset * 3600,
-            utils.iso_str_to_epoch(start_time)) * 1000
-
-        end_time = utils.tz_shift(self.utc_h_offset * 3600,
-            utils.iso_str_to_epoch(end_time)) * 1000
+        start_time = utils.dt_resolvable_to_ms(
+            start_time,
+            utc_offset=self._api.utc_offset,
+            resolution=1000)
+        end_time = utils.dt_resolvable_to_ms(
+            end_time,
+            utc_offset=self._api.utc_offset,
+            resolution=1000)
 
         return self._api.get(endpoints['recording_span'](
             self._id, start_time, end_time), filename if filename else '')
@@ -406,15 +503,36 @@ class UnifiVideoCamera(UnifiVideoSingle):
                 raise ValueError('Unknow recording mode "{}"'.format(
                     recording_mode))
 
-        if pre_padding_secs != None:
+        if pre_padding_secs is not None:
             rec_settings['prePaddingSecs'] = pre_padding_secs
 
-        if post_padding_secs != None:
+        if post_padding_secs is not None:
             rec_settings['postPaddingSecs'] = post_padding_secs
 
         verify = deepcopy(rec_settings)
         self.update(True)
         return verify == self._data['recordingSettings']
+
+    def get_recording_settings(self, all=False):
+        """Get camera's recording settings
+
+        Arguments:
+            all (bool): Whether to show all available settings. The default
+                is to only show the settings that are controllable by calling
+                :func:`~unifi_video.camera.UnifiVideoCamera.set_recording_settings`.
+        """
+
+        controllable = [
+            'motionRecordEnabled',
+            'fullTimeRecordEnabled',
+            'prePaddingSecs',
+            'postPaddingSecs',
+        ]
+
+        all_settings = self._data.get('recordingSettings', {})
+
+        return {k: all_settings.get(k, None) for k in controllable} \
+            if not all else all_settings
 
     def __str__(self):
         _filter = ['name', 'model', 'platform']

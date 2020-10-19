@@ -1,5 +1,6 @@
 import os.path
 import random
+import json
 
 from unifi_video import UnifiVideoAPI, CameraModelError, \
     UnifiVideoVersionError
@@ -8,6 +9,11 @@ try:
     from mock import Mock, patch, MagicMock
 except ModuleNotFoundError:
     from unittest.mock import Mock, patch, MagicMock
+
+empty_response = {
+    'data': [],
+    'meta': {},
+}
 
 def mocked_response(data=None, res_json=True, set_cookies=False, arg_pile=[]):
 
@@ -62,3 +68,10 @@ def get_ufva_w_mocked_urlopen(mocked_urlopen, *args, **kwargs):
     mocked_urlopen.side_effect = mocked_response(*args, **kwargs)
     return UnifiVideoAPI(username='username', password='password',
         addr='0.0.0.0')
+
+def read_fp(basename):
+    with open(os.path.join(
+            os.path.dirname(__file__),
+            'files',
+            basename), 'r') as f:
+        return json.loads(f.read())
